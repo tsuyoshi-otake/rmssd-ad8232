@@ -21,6 +21,12 @@ constexpr uint32_t REFRACTORY_MS    = 300;   // R-wave refractory (HR <= 200 bpm
 constexpr uint32_t PEAK_TIMEOUT_MS  = 120;
 constexpr int      RR_BUF_SIZE      = 128;
 
+// ---------- Display compression ----------
+// Draw one column per N samples; column shows min..max of that bucket so the
+// R-wave amplitude is preserved.  At 250 Hz with N=8 the strip spans
+// SCREEN_W * N / 250 = 320 * 8 / 250 = 10.24 s.
+constexpr int      ECG_DECIM        = 8;
+
 // ---------- Calibration ----------
 constexpr uint32_t CALIB_MIN_MS    = 5UL * 60UL * 1000UL;  // 5 minutes minimum
 constexpr uint32_t CALIB_SAMPLE_MS = 5UL * 1000UL;         // pull one RMSSD every 5 s
@@ -83,9 +89,13 @@ static bool     baselineFrozen = false;
 
 // ---------- Drawing state ----------
 static int      sweepX    = 0;
-static int      prevY     = ECG_MID;
-static bool     prevValid = false;
 static bool     beatTick  = false;
+
+// Per-column min/max accumulator (in ECG units = raw - ecgBase)
+static float    colMin    =  1e9f;
+static float    colMax    = -1e9f;
+static int      colCount  = 0;
+static bool     colClip   = false;
 
 static uint32_t bootMs    = 0;
 static uint32_t nextDisplayMs = 0;
@@ -502,7 +512,9 @@ int ecgToY(float sig) {
   return ECG_MID - (int)(norm * halfH);
 }
 
-void drawSweepPoint(int x, int y, bool leadsOff, bool tick, bool clipped) {
+// Draw one decimated column.  yTop/yBot are the screen-space pixel positions
+// of the bucket's max/min ECG samples (max -> lowest Y, min -> highest Y).
+void drawSweepColumn(int x, int yTop, int yBot, bool leadsOff, bool tick, bool clipped) {
   M5.Lcd.startWrite();
   M5.Lcd.drawFastVLine(x, ECG_TOP, ECG_H, BLACK);
   M5.Lcd.drawPixel(x, ECG_MID, DARKGREY);
@@ -510,13 +522,12 @@ void drawSweepPoint(int x, int y, bool leadsOff, bool tick, bool clipped) {
   if (tick) M5.Lcd.drawFastVLine(x, ECG_TOP, 8, RED);
 
   if (!leadsOff) {
-    if (prevValid) {
-      M5.Lcd.drawLine(x - 1, prevY, x, y, GREEN);
-    } else {
-      M5.Lcd.drawPixel(x, y, GREEN);
-    }
+    if (yTop < ECG_TOP)               yTop = ECG_TOP;
+    if (yBot > ECG_TOP + ECG_H - 1)   yBot = ECG_TOP + ECG_H - 1;
+    int len = yBot - yTop + 1;
+    if (len < 1) len = 1;
+    M5.Lcd.drawFastVLine(x, yTop, len, GREEN);
     if (clipped) {
-      // Clip marker at strip top/bottom edge
       M5.Lcd.drawPixel(x, ECG_TOP + 1,         YELLOW);
       M5.Lcd.drawPixel(x, ECG_TOP + ECG_H - 2, YELLOW);
     }
@@ -693,21 +704,28 @@ void processSample(int rawIn, bool leadsOff) {
     inPeak = false;
   }
 
-  // Determine clip and Y
-  float halfH = ECG_H / 2 - 4;
-  float norm  = sig / (ampEma * 2.5f);
-  bool  clipped = (norm > 1.0f) || (norm < -1.0f);
-  int   y = leadsOff ? ECG_MID : ecgToY(sig);
+  // Accumulate this sample into the current screen column bucket.
+  float norm = sig / (ampEma * 2.5f);
+  if (norm > 1.0f || norm < -1.0f) colClip = true;
+  if (sig < colMin) colMin = sig;
+  if (sig > colMax) colMax = sig;
+  colCount++;
 
-  drawSweepPoint(sweepX, y, leadsOff, beatTick, clipped);
-  beatTick = false;
+  if (colCount < ECG_DECIM) return;
 
-  prevY     = y;
-  prevValid = !leadsOff;
+  // Flush the bucket: max(sig) -> top pixel, min(sig) -> bottom pixel.
+  int yTop = leadsOff ? ECG_MID : ecgToY(colMax);
+  int yBot = leadsOff ? ECG_MID : ecgToY(colMin);
+  drawSweepColumn(sweepX, yTop, yBot, leadsOff, beatTick, colClip);
+
+  beatTick  = false;
+  colCount  = 0;
+  colMin    =  1e9f;
+  colMax    = -1e9f;
+  colClip   = false;
 
   sweepX = (sweepX + 1) % SCREEN_W;
   drawSweepCursor();
-  if (sweepX == 0) prevValid = false;
 }
 
 // ---------- Arduino ----------
