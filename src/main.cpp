@@ -712,8 +712,8 @@ void processSample(int rawIn, bool leadsOff) {
 
 // ---------- Arduino ----------
 constexpr uint8_t LCD_BRIGHTNESS_DIM = 0;     // BtnC "dim" state (essentially off)
-constexpr uint8_t LCD_BRIGHTNESS_ON  = 128;   // BtnC "on"  state
-static uint8_t    lcdBrightness      = LCD_BRIGHTNESS_DIM;
+constexpr uint8_t LCD_BRIGHTNESS_ON  = 32;    // BtnC "on" / power-on default
+static uint8_t    lcdBrightness      = LCD_BRIGHTNESS_ON;
 
 void setup() {
   M5.begin();              // also initializes Serial; we re-init at 460800 below

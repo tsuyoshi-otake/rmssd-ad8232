@@ -96,7 +96,7 @@ $pio = "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
 |--------|------|
 | **BtnA**（左） | キャリブレーション窓をクリアして最初からやり直し（5分待ち再開） |
 | **BtnB**（中央）| `frozen` ⇄ `rolling` をトグル。`frozen` にした瞬間のベースラインで固定したいとき用 |
-| **BtnC**（右） | LCD バックライトを **dim (≈0)** ⇄ **ON (128)** でトグル。起動直後は dim |
+| **BtnC**（右） | LCD バックライトを **ON (32)** ⇄ **dim (0)** でトグル。起動直後は ON |
 
 ログ ON/OFF はシリアルコマンド `LOG ON` / `LOG OFF` で切替（SD FAIL 時は ON 不可）。
 画面右上の `LOG ON`（緑）／`LOG OFF`（灰）／`SD FAIL`（赤）は LCD が点灯しているときだけ見える。
@@ -286,7 +286,7 @@ data/latest/summary.csv の直近10分の rmssd/base 比を見て、
 
 ## LCD 明るさ
 
-実行時は **BtnC** で `LCD_BRIGHTNESS_DIM` (0) ⇄ `LCD_BRIGHTNESS_ON` (128) を切替。起動時は `DIM` で始まる（省電力 / 暗所向け）。
+実行時は **BtnC** で `LCD_BRIGHTNESS_ON` (32) ⇄ `LCD_BRIGHTNESS_DIM` (0) を切替。起動時は `ON (32)` で立ち上がる（暗所でちょうど見える、省電力）。
 
 シリアルにも `I,...,LCD,DIM` / `I,...,LCD,ON` のイベントが出る。
 
@@ -294,7 +294,7 @@ data/latest/summary.csv の直近10分の rmssd/base 比を見て、
 
 ```cpp
 constexpr uint8_t LCD_BRIGHTNESS_DIM = 0;     // 0 だと完全消灯に近い
-constexpr uint8_t LCD_BRIGHTNESS_ON  = 128;   // 通常は 64..160 あたりが見やすい
+constexpr uint8_t LCD_BRIGHTNESS_ON  = 32;    // 明所なら 64..160 まで上げる
 ```
 
 を編集して再ビルド。
