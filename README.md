@@ -96,9 +96,10 @@ $pio = "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
 |--------|------|
 | **BtnA**（左） | キャリブレーション窓をクリアして最初からやり直し（5分待ち再開） |
 | **BtnB**（中央）| `frozen` ⇄ `rolling` をトグル。`frozen` にした瞬間のベースラインで固定したいとき用 |
-| **BtnC**（右） | MicroSD ログの `LOG ON` / `LOG OFF` をトグル。`SD FAIL` のときは押しても無効 |
+| **BtnC**（右） | LCD バックライトを **dim (≈0)** ⇄ **ON (128)** でトグル。起動直後は dim |
 
-画面右上に `LOG ON`（緑）／`LOG OFF`（灰）／`SD FAIL`（赤）が常時表示される。
+ログ ON/OFF はシリアルコマンド `LOG ON` / `LOG OFF` で切替（SD FAIL 時は ON 不可）。
+画面右上の `LOG ON`（緑）／`LOG OFF`（灰）／`SD FAIL`（赤）は LCD が点灯しているときだけ見える。
 
 電極が外れると `LEADS OFF` と表示され、波形描画もキャリブレーションのサンプル蓄積も止まる。電極を貼り直せば自然に再開する。
 
@@ -204,7 +205,7 @@ ECG 生波形まで含めるためボーレートを **460800 bps** に上げて
 
 `<unix_ms>` は `TIME` 同期前は `0`。
 
-主なイベントコード：`BOOT` / `SD_OK` / `SD_FAIL` / `RR_LOG` / `SUM_LOG` / `LOG_ON` / `LOG_OFF` / `TIME_SET` / `ECG_ON` / `ECG_OFF`
+主なイベントコード：`BOOT` / `SD_OK` / `SD_FAIL` / `RR_LOG` / `SUM_LOG` / `LOG_ON` / `LOG_OFF` / `LOG_FAIL` / `TIME_SET` / `ECG_ON` / `ECG_OFF` / `LCD,DIM` / `LCD,ON`
 
 ### PC → ファーム コマンド
 
@@ -214,6 +215,7 @@ ECG 生波形まで含めるためボーレートを **460800 bps** に上げて
 |----------|------|
 | `TIME <unix_sec>` | 絶対時刻同期。応答に `I,...,TIME_SET,<unix_sec>` |
 | `ECG ON` / `ECG OFF` | ECG 生波形 (E行) ストリームの ON/OFF |
+| `LOG ON` / `LOG OFF` | MicroSD ログの ON/OFF（旧 BtnC 機能、SD FAIL 時は `LOG_FAIL`） |
 
 ### 帯域目安
 
@@ -284,11 +286,18 @@ data/latest/summary.csv の直近10分の rmssd/base 比を見て、
 
 ## LCD 明るさ
 
-`src/main.cpp` の `constexpr uint8_t LCD_BRIGHTNESS = 0;` で制御。
-- `0` (デフォルト): バックライト最低（暗い部屋で視認可能、省電力）
-- `8〜16`: 明るい部屋でも見える
-- `64〜128`: M5Stack デフォルトに近い
-- `255`: 最大
+実行時は **BtnC** で `LCD_BRIGHTNESS_DIM` (0) ⇄ `LCD_BRIGHTNESS_ON` (128) を切替。起動時は `DIM` で始まる（省電力 / 暗所向け）。
+
+シリアルにも `I,...,LCD,DIM` / `I,...,LCD,ON` のイベントが出る。
+
+明るさ値を恒久的に変えたい場合は `src/main.cpp` の：
+
+```cpp
+constexpr uint8_t LCD_BRIGHTNESS_DIM = 0;     // 0 だと完全消灯に近い
+constexpr uint8_t LCD_BRIGHTNESS_ON  = 128;   // 通常は 64..160 あたりが見やすい
+```
+
+を編集して再ビルド。
 
 ## ファイル構成
 

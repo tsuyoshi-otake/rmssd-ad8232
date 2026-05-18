@@ -393,6 +393,20 @@ static void handleSerialLine(const char* line) {
     emitEvent("ECG_OFF");
     return;
   }
+  if (strcmp(line, "LOG ON") == 0) {
+    if (sdOk) {
+      loggingEnabled = true;
+      emitEvent("LOG_ON");
+    } else {
+      emitEvent("LOG_FAIL", "sd_not_ok");
+    }
+    return;
+  }
+  if (strcmp(line, "LOG OFF") == 0) {
+    loggingEnabled = false;
+    emitEvent("LOG_OFF");
+    return;
+  }
 }
 
 static void pollSerial() {
@@ -697,13 +711,15 @@ void processSample(int rawIn, bool leadsOff) {
 }
 
 // ---------- Arduino ----------
-constexpr uint8_t LCD_BRIGHTNESS = 0;  // minimum backlight; raise to 8..16 for daylight visibility
+constexpr uint8_t LCD_BRIGHTNESS_DIM = 0;     // BtnC "dim" state (essentially off)
+constexpr uint8_t LCD_BRIGHTNESS_ON  = 128;   // BtnC "on"  state
+static uint8_t    lcdBrightness      = LCD_BRIGHTNESS_DIM;
 
 void setup() {
   M5.begin();              // also initializes Serial; we re-init at 460800 below
   Serial.begin(460800);    // higher baud for ECG raw streaming (~5 KB/s)
 
-  M5.Lcd.setBrightness(LCD_BRIGHTNESS);
+  M5.Lcd.setBrightness(lcdBrightness);
 
   pinMode(LO_PLUS_PIN,  INPUT_PULLDOWN);
   pinMode(LO_MINUS_PIN, INPUT_PULLDOWN);
@@ -763,9 +779,14 @@ void loop() {
   if (M5.BtnB.wasPressed() && !isnan(rmssdBase)) {
     baselineFrozen = !baselineFrozen;
   }
-  if (M5.BtnC.wasPressed() && sdOk) {
-    loggingEnabled = !loggingEnabled;
-    emitEvent(loggingEnabled ? "LOG_ON" : "LOG_OFF");
+  // BtnC: toggle LCD backlight between dim (≈off) and visible.
+  if (M5.BtnC.wasPressed()) {
+    lcdBrightness = (lcdBrightness == LCD_BRIGHTNESS_DIM)
+                      ? LCD_BRIGHTNESS_ON
+                      : LCD_BRIGHTNESS_DIM;
+    M5.Lcd.setBrightness(lcdBrightness);
+    emitEvent("LCD",
+              lcdBrightness == LCD_BRIGHTNESS_DIM ? "DIM" : "ON");
   }
 
   updateCalibration(nowMs, leadsOff, lockout);
