@@ -16,6 +16,12 @@ constexpr uint32_t REFRACTORY_MS    = 300;   // R-wave refractory (HR <= 200 bpm
 constexpr uint32_t PEAK_TIMEOUT_MS  = 120;
 constexpr int      RR_BUF_SIZE      = 128;
 
+// ---------- Calibration ----------
+constexpr uint32_t CALIB_MIN_MS    = 5UL * 60UL * 1000UL;  // 5 minutes minimum
+constexpr uint32_t CALIB_SAMPLE_MS = 5UL * 1000UL;         // pull one RMSSD every 5 s
+constexpr int      CALIB_BUF_SIZE  = 60;                   // 5 min / 5 s
+constexpr int      CALIB_MIN_FILL  = 50;                   // need >= 80% full to accept
+
 // ---------- Layout ----------
 constexpr int SCREEN_W = 320;
 constexpr int SCREEN_H = 240;
@@ -56,6 +62,14 @@ static uint32_t lastBeatMs = 0;
 static float    bpm        = 0;
 static float    rmssd      = 0;
 static float    rmssdBase  = NAN;
+
+// ---------- Calibration state (rolling 5-min median) ----------
+static float    calibBuf[CALIB_BUF_SIZE];
+static int      calibHead = 0;
+static int      calibCount = 0;
+static uint32_t calibStartMs    = 0;
+static uint32_t calibNextSampleMs = 0;
+static bool     baselineFrozen = false;
 
 // ---------- Drawing state ----------
 static int      sweepX    = 0;
@@ -110,6 +124,56 @@ float calcRMSSD() {
   }
   if (n == 0) return 0;
   return sqrtf(sumsq / (float)n);
+}
+
+// ---------- Calibration helpers ----------
+void resetCalibration(uint32_t nowMs) {
+  calibHead         = 0;
+  calibCount        = 0;
+  calibStartMs      = nowMs;
+  calibNextSampleMs = nowMs + CALIB_SAMPLE_MS;
+  baselineFrozen    = false;
+  rmssdBase         = NAN;
+}
+
+void calibPush(float v) {
+  calibBuf[calibHead] = v;
+  calibHead = (calibHead + 1) % CALIB_BUF_SIZE;
+  if (calibCount < CALIB_BUF_SIZE) calibCount++;
+}
+
+float calibMedian() {
+  if (calibCount < 1) return NAN;
+  static float tmp[CALIB_BUF_SIZE];
+  for (int i = 0; i < calibCount; i++) tmp[i] = calibBuf[i];
+  for (int i = 1; i < calibCount; i++) {
+    float key = tmp[i];
+    int j = i - 1;
+    while (j >= 0 && tmp[j] > key) {
+      tmp[j + 1] = tmp[j];
+      j--;
+    }
+    tmp[j + 1] = key;
+  }
+  if (calibCount & 1) return tmp[calibCount / 2];
+  return 0.5f * (tmp[calibCount / 2 - 1] + tmp[calibCount / 2]);
+}
+
+void updateCalibration(uint32_t nowMs, bool leadsOff, bool lockout) {
+  if (baselineFrozen)                 return;
+  if (leadsOff || lockout)            return;
+  if (rrCount < 20 || rmssd <= 0)     return;
+  if (nowMs < calibNextSampleMs)      return;
+
+  calibPush(rmssd);
+  calibNextSampleMs = nowMs + CALIB_SAMPLE_MS;
+
+  uint32_t elapsed   = nowMs - calibStartMs;
+  bool     enoughT   = (elapsed >= CALIB_MIN_MS);
+  bool     enoughN   = (calibCount >= CALIB_MIN_FILL);
+  if (enoughT && enoughN) {
+    rmssdBase = calibMedian();
+  }
 }
 
 void registerBeat(uint32_t tMs, float peak) {
@@ -204,15 +268,24 @@ void drawStats(bool leadsOff, bool lockout) {
   M5.Lcd.printf("HR %3.0f  RMSSD %3.0f ms", bpm, rmssd);
 
   M5.Lcd.setCursor(4, STATS_TOP + 26);
+  uint32_t nowMs = millis();
   if (rrCount < 20 || rmssd <= 0) {
     M5.Lcd.setTextColor(YELLOW, BLACK);
     M5.Lcd.printf("collecting RR  n=%d", rrCount);
   } else if (isnan(rmssdBase)) {
-    M5.Lcd.setTextColor(CYAN, BLACK);
-    M5.Lcd.print("BtnA: set baseline");
+    uint32_t elapsed = nowMs - calibStartMs;
+    uint32_t remainS = (elapsed < CALIB_MIN_MS) ? (CALIB_MIN_MS - elapsed) / 1000 : 0;
+    M5.Lcd.setTextColor(YELLOW, BLACK);
+    M5.Lcd.printf("calib %lu:%02lu  n=%d",
+                  (unsigned long)(remainS / 60),
+                  (unsigned long)(remainS % 60),
+                  calibCount);
+  } else if (baselineFrozen) {
+    M5.Lcd.setTextColor(WHITE, BLACK);
+    M5.Lcd.printf("base %.0f ms (frozen)", rmssdBase);
   } else {
     M5.Lcd.setTextColor(WHITE, BLACK);
-    M5.Lcd.printf("base %.0f ms (BtnB clr)", rmssdBase);
+    M5.Lcd.printf("base %.0f ms (rolling)", rmssdBase);
   }
 }
 
@@ -340,6 +413,7 @@ void setup() {
   drawBar();
 
   bootMs = millis();
+  resetCalibration(bootMs);
 
   // 80 MHz APB / prescaler 80 -> 1 MHz timer; alarm at SAMPLE_US ticks
   sampleTimer = timerBegin(0, 80, true);
@@ -359,20 +433,30 @@ void loop() {
     processSample((int)s.raw, s.leadsOff != 0);
   }
 
-  if (M5.BtnA.wasPressed() && rmssd > 0) rmssdBase = rmssd;
-  if (M5.BtnB.wasPressed())              rmssdBase = NAN;
-
   uint32_t nowMs = millis();
+  bool     leadsOff = (digitalRead(LO_PLUS_PIN) || digitalRead(LO_MINUS_PIN));
+  bool     lockout  = (nowMs - bootMs) < STARTUP_LOCKOUT_MS;
+
+  // BtnA: restart calibration. BtnB: freeze / unfreeze the rolling baseline.
+  if (M5.BtnA.wasPressed()) {
+    resetCalibration(nowMs);
+  }
+  if (M5.BtnB.wasPressed() && !isnan(rmssdBase)) {
+    baselineFrozen = !baselineFrozen;
+  }
+
+  updateCalibration(nowMs, leadsOff, lockout);
+
   if (nowMs > nextDisplayMs) {
     nextDisplayMs = nowMs + 500;
-    bool leadsOff = (digitalRead(LO_PLUS_PIN) || digitalRead(LO_MINUS_PIN));
-    bool lockout  = (nowMs - bootMs) < STARTUP_LOCKOUT_MS;
     drawStats(leadsOff, lockout);
     drawBar();
 
-    Serial.print("BPM:");    Serial.print(bpm);
-    Serial.print(",RMSSD:"); Serial.print(rmssd);
-    Serial.print(",BASE:");  Serial.print(isnan(rmssdBase) ? 0 : rmssdBase);
-    Serial.print(",DROPS:"); Serial.println(ringDrops);
+    Serial.print("BPM:");     Serial.print(bpm);
+    Serial.print(",RMSSD:");  Serial.print(rmssd);
+    Serial.print(",BASE:");   Serial.print(isnan(rmssdBase) ? 0 : rmssdBase);
+    Serial.print(",CALIBN:"); Serial.print(calibCount);
+    Serial.print(",FROZEN:"); Serial.print(baselineFrozen ? 1 : 0);
+    Serial.print(",DROPS:");  Serial.println(ringDrops);
   }
 }
