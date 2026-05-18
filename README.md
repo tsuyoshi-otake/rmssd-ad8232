@@ -187,6 +187,8 @@ BASE:AAA + LCD 常時表示で **おおむね 3〜6時間**（バッテリー条
 - **R波検出**: ベース除去後の絶対値に対する自己適応閾値ピーク検出（不応期 300 ms = HR 上限 200 bpm）
 - **振幅自動スケール**: `ampEma` (α=0.005) で直近の信号強度を追跡し、波形表示を画面に収める。クリップ時は ECG 帯の上下端に黄色ドット
 - **波形ダウンサンプル**: 1 カラム = 8 サンプル分の **min/max** を 1 ピクセル幅の縦線で描画。R 波の振幅は潰れず、画面に約 **10.24 秒**（`SCREEN_W × ECG_DECIM ÷ 250Hz`）入る。横軸の時間長を変えたければ `ECG_DECIM` を編集
+- **呼吸推定 (EDR)**: 呼吸性洞性不整脈を利用して **BrPM (呼吸数)** を推定。HRV ベース (RR インターバル変調 = FM) と R 波振幅変調 (AM) の **2 系列を融合**。各拍を 4Hz 等間隔に線形補間 → 40 秒窓 → 0.10〜0.50 Hz 1次IIR バンドパス → 自己相関 (lag 8〜40) でピーク周期検出。`RQI = r_peak / r0` を信頼度とし、0.25 以上なら採用。両系列とも有効なら RQI 重み付け平均。**1Hz 更新**、CPU 数% / RAM 約 5KB。起動から 20 秒 + 20 拍以上必要
+- **PNS proxy の呼吸正規化**: `rmssd_norm = rmssd / (1 + 0.03 × |brpm − 12|)` で PNS バーを補正。呼吸を遅くしただけで RMSSD が見かけ上跳ねる影響を抑える。信頼度 < 0.3 のときは無補正
 - **RMSSD**: 直近最大128 RR間隔。外れ値除去は **2段階**：固定上限 `|ΔRR| < 300 ms` ＋ **Malik 20%**（`|ΔRR| < 0.2 × RR_prev`）
 - **自動キャリブレーション**: 5秒毎に 1サンプル、最大 60 サンプル（5分間）の **rolling 中央値** をベースラインに採用。起動から 5分経過 + サンプル数 ≥ 50 で確定し、以後 5秒毎に更新
 - **PNSプロキシバー**: `RMSSD / RMSSD_baseline` を log2 スケールで [0.5x, 2.0x] に正規化
@@ -202,6 +204,7 @@ ECG 生波形まで含めるためボーレートを **460800 bps** に上げて
 | `I` | `I,<session_ms>,<unix_ms>,<event>[,<param>]` | イベント時 |
 | `S` | `S,<session_ms>,<unix_ms>,<bpm>,<rmssd>,<base>,<calibn>,<frozen>,<drops>,<leads_off>` | 500 ms 毎 |
 | `R` | `R,<session_ms>,<unix_ms>,<rr_ms>,<bpm>,<rmssd>,<base>,<ratio>,<rr_count>,<leads_off>` | R 波検出毎 |
+| `B` | `B,<session_ms>,<unix_ms>,<brpm>,<brpm_conf>,<src>,<rmssd_norm>,<brpm_fm>,<rqi_fm>,<brpm_am>,<rqi_am>` | 500 ms 毎（src: 0=NONE,1=FM,2=AM,3=FUSED） |
 | `E` | `E,<session_ms>,<raw>` | 250 Hz（デフォルト ON、`ECG OFF` で停止） |
 
 `<unix_ms>` は `TIME` 同期前は `0`。
@@ -258,7 +261,8 @@ data/
 ├── session_20260518_220147/
 │   ├── ecg.csv       (250 Hz の wall_iso, session_ms, raw)
 │   ├── rr.csv        (R波毎)
-│   ├── summary.csv   (500 ms 毎、画面表示と同じ値)
+│   ├── summary.csv   (500 ms 毎、画面表示と同じ値 + 末尾4列に brpm/brpm_conf/brpm_source/rmssd_norm)
+│   ├── breath.csv    (500 ms 毎、EDR 詳細: brpm, conf, source, rmssd_norm, brpm_fm, rqi_fm, brpm_am, rqi_am)
 │   └── events.csv    (BOOT/SD_OK/TIME_SET など)
 └── latest -> session_20260518_220147/   (シンボリックリンク、Windowsで権限不足ならLATEST.txt)
 ```
@@ -277,6 +281,9 @@ wall_iso,session_ms,unix_ms,bpm,rmssd,base,calibn,frozen,drops,leads_off
 data/latest/summary.csv の直近10分の rmssd/base 比を見て、
 ベースラインから外れている区間と、その時の leads_off=0 を確認して、
 ストレス傾向を要約して。
+
+data/latest/breath.csv の brpm_conf >= 0.4 の区間だけで brpm の
+ヒストグラム傾向を出して。極端な変動があれば時刻と一緒に教えて。
 ```
 
 ### 注意

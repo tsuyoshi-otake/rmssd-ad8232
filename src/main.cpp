@@ -27,6 +27,29 @@ constexpr int      RR_BUF_SIZE      = 128;
 // SCREEN_W * N / 250 = 320 * 8 / 250 = 10.24 s.
 constexpr int      ECG_DECIM        = 8;
 
+// ---------- ECG-derived respiration (EDR) ----------
+// Fuse two streams: HRV-based "FM" (RR interval modulation) and amplitude-
+// based "AM" (R-wave peak modulation).  Each is resampled to 4 Hz over a
+// 40 s window, band-passed to 0.10..0.50 Hz (6..30 BrPM), and the dominant
+// period is found by autocorrelation.  The autocorrelation peak/lag-0 ratio
+// is taken as a quality index (RQI).
+constexpr int      BEAT_BUF_SIZE      = 256;          // recent beats; ~4 min @ 60 bpm
+constexpr int      EDR_N              = 160;          // 40 s * 4 Hz
+constexpr float    EDR_FS_HZ          = 4.0f;
+constexpr float    EDR_HP_HZ          = 0.10f;        // 6 BrPM
+constexpr float    EDR_LP_HZ          = 0.50f;        // 30 BrPM
+constexpr int      EDR_LAG_MIN        = 8;            // 8/4 = 2 s  -> 30 BrPM
+constexpr int      EDR_LAG_MAX        = 40;           // 40/4 = 10 s -> 6 BrPM
+constexpr uint32_t EDR_UPDATE_MS      = 1000;
+constexpr uint32_t EDR_MIN_DATA_MS    = 20000;        // need >= 20 s of beats
+constexpr int      EDR_MIN_BEATS      = 20;
+constexpr float    EDR_MIN_RQI        = 0.25f;        // below this -> not valid
+
+// PNS proxy: rmssd_norm = rmssd / (1 + k * |brpm - base_brpm|).
+constexpr float    PNS_NORM_REF_BRPM  = 12.0f;
+constexpr float    PNS_NORM_K         = 0.03f;
+constexpr float    PNS_NORM_MIN_CONF  = 0.30f;
+
 // ---------- Calibration ----------
 constexpr uint32_t CALIB_MIN_MS    = 5UL * 60UL * 1000UL;  // 5 minutes minimum
 constexpr uint32_t CALIB_SAMPLE_MS = 5UL * 1000UL;         // pull one RMSSD every 5 s
@@ -86,6 +109,30 @@ static int      calibCount = 0;
 static uint32_t calibStartMs    = 0;
 static uint32_t calibNextSampleMs = 0;
 static bool     baselineFrozen = false;
+
+// ---------- Beat history for EDR ----------
+struct BeatRecord {
+  uint32_t tMs;     // detection time
+  float    rr_ms;
+  float    peak;    // R-wave amplitude (from peak detector)
+};
+static BeatRecord beatBuf[BEAT_BUF_SIZE];
+static int        beatHead    = 0;
+static int        beatCount   = 0;
+static uint32_t   firstBeatMs = 0;
+
+// ---------- EDR (breathing) state ----------
+enum BrpmSource : uint8_t { BRPM_NONE = 0, BRPM_FM, BRPM_AM, BRPM_FUSED };
+static float      brpm        = 0.0f;
+static float      brpmConf    = 0.0f;     // 0..1 (from RQI)
+static BrpmSource brpmSource  = BRPM_NONE;
+static bool       brpmValid   = false;
+static float      brpmFm      = 0.0f;
+static float      brpmAm      = 0.0f;
+static float      brpmRqiFm   = 0.0f;
+static float      brpmRqiAm   = 0.0f;
+static uint32_t   brpmLastUpdateMs = 0;
+static float      rmssdNorm   = 0.0f;     // PNS-normalised RMSSD
 
 // ---------- Drawing state ----------
 static int      sweepX    = 0;
@@ -255,6 +302,16 @@ static void emitRR(float rr) {
                 rmssd, baseline, ratio, rrCount, 0);
 }
 
+// Breathing summary: B,session_ms,unix_ms,brpm,conf,source(0..3),rmssd_norm,brpm_fm,rqi_fm,brpm_am,rqi_am
+static void emitBrpm() {
+  emitCommonPrefix('B');
+  Serial.printf(",%.2f,%.3f,%d,%.2f,%.2f,%.3f,%.2f,%.3f\n",
+                brpm, brpmConf, (int)brpmSource,
+                rmssdNorm,
+                brpmFm, brpmRqiFm,
+                brpmAm, brpmRqiAm);
+}
+
 static void emitEcgSample(int raw) {
   if (!ecgStreamEnabled) return;
   Serial.print('E');
@@ -305,7 +362,7 @@ static void initSdLogging() {
     "ratio,rr_count,quality,leads_off");
   sumLogFile.println(
     "session_ms,unix_time_ms,iso_time,bpm,rmssd_ms,baseline_ms,ratio,"
-    "rr_count,leads_off,noise_count");
+    "rr_count,leads_off,noise_count,brpm,brpm_conf,brpm_source,rmssd_norm");
   rrLogFile.flush();
   sumLogFile.flush();
 
@@ -363,13 +420,14 @@ static void writeSummaryRow(bool leadsOff) {
   float ratio    = (isnan(rmssdBase) || rmssdBase <= 0)
                      ? 0.0f
                      : (rmssd / rmssdBase);
-  char line[200];
+  char line[256];
   snprintf(line, sizeof(line),
-           "%lu,%s,%s,%.2f,%.2f,%.2f,%.4f,%d,%d,%d",
+           "%lu,%s,%s,%.2f,%.2f,%.2f,%.4f,%d,%d,%d,%.2f,%.3f,%d,%.2f",
            (unsigned long)(millis() - sessionStartMs),
            unixStr, iso,
            bpm, rmssd, baseline, ratio,
-           rrCount, leadsOff ? 1 : 0, 0 /* noise_count */);
+           rrCount, leadsOff ? 1 : 0, 0 /* noise_count */,
+           brpm, brpmConf, (int)brpmSource, rmssdNorm);
   sumLogFile.println(line);
 }
 
@@ -486,6 +544,179 @@ void updateCalibration(uint32_t nowMs, bool leadsOff, bool lockout) {
   }
 }
 
+// ---------- EDR helpers ----------
+// One-pole high-pass:  y[n] = a*(y[n-1] + x[n] - x[n-1]), a = 1/(1 + 2*pi*fc/Fs)
+// One-pole low-pass:   y[n] = (1-b)*y[n-1] + b*x[n],      b = (2*pi*fc/Fs)/(1 + 2*pi*fc/Fs)
+static void bandpassInPlace(float* x, int n, float fs, float fHi, float fLo) {
+  // HPF cutoff = fHi (remove DC + RSA outside band), LPF cutoff = fLo.
+  const float twoPi = 6.283185307f;
+  float wHp = twoPi * fHi / fs;
+  float wLp = twoPi * fLo / fs;
+  float aHp = 1.0f / (1.0f + wHp);
+  float bLp = wLp / (1.0f + wLp);
+
+  // HPF pass
+  float yPrev = 0, xPrev = 0;
+  for (int i = 0; i < n; i++) {
+    float xi = x[i];
+    float yi = aHp * (yPrev + xi - xPrev);
+    yPrev = yi; xPrev = xi;
+    x[i] = yi;
+  }
+  // LPF pass
+  float lpPrev = 0;
+  for (int i = 0; i < n; i++) {
+    lpPrev = lpPrev + bLp * (x[i] - lpPrev);
+    x[i] = lpPrev;
+  }
+}
+
+// Pull the most recent N samples of (tMs, value) from beatBuf with a chosen
+// extractor (RR or peak), pad/skip as needed, and linearly resample to fs over
+// the last windowMs ms.  Returns true if windowMs of data is available.
+static bool resampleBeatsTo(float* out, int n, float fs, uint32_t nowMs,
+                            uint32_t windowMs, bool useRR) {
+  if (beatCount < 2) return false;
+  uint32_t startMs = nowMs - windowMs;
+
+  // Walk the ring buffer from oldest to newest, collect (t, v) pairs.
+  // Up to BEAT_BUF_SIZE pairs.
+  struct P { uint32_t t; float v; };
+  static P pts[BEAT_BUF_SIZE];
+  int m = 0;
+  int oldest = (beatHead - beatCount + BEAT_BUF_SIZE) % BEAT_BUF_SIZE;
+  for (int i = 0; i < beatCount; i++) {
+    int idx = (oldest + i) % BEAT_BUF_SIZE;
+    if (beatBuf[idx].tMs < startMs) continue;
+    pts[m].t = beatBuf[idx].tMs;
+    pts[m].v = useRR ? beatBuf[idx].rr_ms : beatBuf[idx].peak;
+    m++;
+  }
+  if (m < 4) return false;
+
+  // For each output sample, find the bracketing pair and interpolate.
+  // Sample i corresponds to time startMs + i * (1000/fs).
+  float stepMs = 1000.0f / fs;
+  int p = 0;
+  for (int i = 0; i < n; i++) {
+    uint32_t t = startMs + (uint32_t)(i * stepMs);
+    while (p + 1 < m && pts[p + 1].t <= t) p++;
+    if (p + 1 >= m) {
+      out[i] = pts[m - 1].v;
+    } else if (t <= pts[p].t) {
+      out[i] = pts[p].v;
+    } else {
+      float span = (float)(pts[p + 1].t - pts[p].t);
+      float frac = span > 0 ? (float)(t - pts[p].t) / span : 0;
+      out[i] = pts[p].v + frac * (pts[p + 1].v - pts[p].v);
+    }
+  }
+  return true;
+}
+
+// Autocorrelation peak in [lagMin, lagMax].  Returns RQI = r_peak/r0 and the
+// BrPM corresponding to the best lag.
+static void autocorrBrpm(const float* x, int n, int lagMin, int lagMax,
+                         float fs, float* brpmOut, float* rqiOut) {
+  // De-mean
+  static float buf[EDR_N];
+  float mean = 0;
+  for (int i = 0; i < n; i++) mean += x[i];
+  mean /= n;
+  for (int i = 0; i < n; i++) buf[i] = x[i] - mean;
+
+  // r0 = sum x^2
+  float r0 = 0;
+  for (int i = 0; i < n; i++) r0 += buf[i] * buf[i];
+  if (r0 < 1e-6f) { *brpmOut = 0; *rqiOut = 0; return; }
+
+  float rMax = -1e9f;
+  int   lagBest = 0;
+  for (int lag = lagMin; lag <= lagMax; lag++) {
+    float r = 0;
+    for (int i = 0; i < n - lag; i++) r += buf[i] * buf[i + lag];
+    if (r > rMax) { rMax = r; lagBest = lag; }
+  }
+  if (lagBest == 0) { *brpmOut = 0; *rqiOut = 0; return; }
+
+  float periodS = (float)lagBest / fs;
+  *brpmOut = (periodS > 0) ? 60.0f / periodS : 0;
+  *rqiOut  = (rMax > 0)    ? rMax / r0       : 0;
+}
+
+static void updateBrpm(uint32_t nowMs, bool leadsOff, bool lockout) {
+  if ((nowMs - brpmLastUpdateMs) < EDR_UPDATE_MS) return;
+  brpmLastUpdateMs = nowMs;
+
+  // Reset (slightly) on LEADS OFF or startup so the window doesn't poison
+  // the next valid update.
+  if (leadsOff || lockout || beatCount < EDR_MIN_BEATS ||
+      firstBeatMs == 0 || (nowMs - firstBeatMs) < EDR_MIN_DATA_MS) {
+    brpmValid  = false;
+    brpmConf   = 0.0f;
+    brpmSource = BRPM_NONE;
+    // brpm holds last value for display "stickiness"
+    return;
+  }
+
+  static float fmBuf[EDR_N];
+  static float amBuf[EDR_N];
+  bool gotFm = resampleBeatsTo(fmBuf, EDR_N, EDR_FS_HZ, nowMs,
+                               (uint32_t)(EDR_N * 1000.0f / EDR_FS_HZ), true);
+  bool gotAm = resampleBeatsTo(amBuf, EDR_N, EDR_FS_HZ, nowMs,
+                               (uint32_t)(EDR_N * 1000.0f / EDR_FS_HZ), false);
+
+  brpmFm = brpmAm = brpmRqiFm = brpmRqiAm = 0;
+  if (gotFm) {
+    bandpassInPlace(fmBuf, EDR_N, EDR_FS_HZ, EDR_HP_HZ, EDR_LP_HZ);
+    autocorrBrpm(fmBuf, EDR_N, EDR_LAG_MIN, EDR_LAG_MAX, EDR_FS_HZ,
+                 &brpmFm, &brpmRqiFm);
+  }
+  if (gotAm) {
+    bandpassInPlace(amBuf, EDR_N, EDR_FS_HZ, EDR_HP_HZ, EDR_LP_HZ);
+    autocorrBrpm(amBuf, EDR_N, EDR_LAG_MIN, EDR_LAG_MAX, EDR_FS_HZ,
+                 &brpmAm, &brpmRqiAm);
+  }
+
+  bool okFm = brpmRqiFm >= EDR_MIN_RQI && brpmFm > 0;
+  bool okAm = brpmRqiAm >= EDR_MIN_RQI && brpmAm > 0;
+
+  if (okFm && okAm) {
+    float wFm = brpmRqiFm, wAm = brpmRqiAm;
+    brpm       = (wFm * brpmFm + wAm * brpmAm) / (wFm + wAm);
+    brpmConf   = 0.5f * (brpmRqiFm + brpmRqiAm);
+    brpmSource = BRPM_FUSED;
+    brpmValid  = true;
+  } else if (okFm) {
+    brpm       = brpmFm;
+    brpmConf   = brpmRqiFm;
+    brpmSource = BRPM_FM;
+    brpmValid  = true;
+  } else if (okAm) {
+    brpm       = brpmAm;
+    brpmConf   = brpmRqiAm;
+    brpmSource = BRPM_AM;
+    brpmValid  = true;
+  } else {
+    brpmValid  = false;
+    brpmConf   = 0;
+    brpmSource = BRPM_NONE;
+  }
+}
+
+static float computeRmssdNorm() {
+  if (!brpmValid || brpmConf < PNS_NORM_MIN_CONF || rmssd <= 0) return rmssd;
+  float dev = fabsf(brpm - PNS_NORM_REF_BRPM);
+  return rmssd / (1.0f + PNS_NORM_K * dev);
+}
+
+static void pushBeatHistory(uint32_t tMs, float rr, float peak) {
+  beatBuf[beatHead] = { tMs, rr, peak };
+  beatHead = (beatHead + 1) % BEAT_BUF_SIZE;
+  if (beatCount < BEAT_BUF_SIZE) beatCount++;
+  if (firstBeatMs == 0) firstBeatMs = tMs;
+}
+
 void registerBeat(uint32_t tMs, float peak) {
   if (lastBeatMs != 0) {
     float rr = (float)(tMs - lastBeatMs);
@@ -493,6 +724,7 @@ void registerBeat(uint32_t tMs, float peak) {
       addRR(rr);
       bpm = 60000.0f / rr;
       rmssd = calcRMSSD();
+      pushBeatHistory(tMs, rr, peak);
       enqueueRREvent(rr, /*leadsOff=*/false);  // detection only fires when leads on
       emitRR(rr);
     }
@@ -567,9 +799,32 @@ void drawLogIndicator() {
   }
 }
 
+void drawBrpmIndicator() {
+  // Small badge under the LOG indicator at top-right. Colour encodes both
+  // confidence and source: green=FUSED, cyan=FM, yellow=AM, grey=invalid.
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setCursor(SCREEN_W - 50, STATS_TOP + 14);
+  if (!brpmValid) {
+    M5.Lcd.setTextColor(DARKGREY, BLACK);
+    M5.Lcd.print("Br --  ");
+    return;
+  }
+  uint16_t c = DARKGREY;
+  switch (brpmSource) {
+    case BRPM_FUSED: c = GREEN;  break;
+    case BRPM_FM:    c = CYAN;   break;
+    case BRPM_AM:    c = YELLOW; break;
+    default:         c = DARKGREY; break;
+  }
+  if (brpmConf < 0.30f) c = DARKGREY;
+  M5.Lcd.setTextColor(c, BLACK);
+  M5.Lcd.printf("Br %4.1f", brpm);
+}
+
 void drawStats(bool leadsOff, bool lockout) {
   M5.Lcd.fillRect(0, STATS_TOP, SCREEN_W, STATS_H, BLACK);
   drawLogIndicator();
+  drawBrpmIndicator();
   M5.Lcd.setTextSize(2);
 
   if (leadsOff) {
@@ -637,7 +892,10 @@ void drawBar() {
 
   if (isnan(rmssdBase) || rmssd <= 0 || rrCount < 20) return;
 
-  float ratio = rmssd / rmssdBase;
+  // Use the breathing-normalised RMSSD when available; falls back to raw
+  // rmssd inside computeRmssdNorm() if BrPM is not valid.
+  float numerator = (rmssdNorm > 0) ? rmssdNorm : rmssd;
+  float ratio = numerator / rmssdBase;
   float t = (log2f(ratio) + 1.0f) * 0.5f;  // 0.5x -> 0, 1x -> 0.5, 2x -> 1
   if (t < 0) t = 0;
   if (t > 1) t = 1;
@@ -808,6 +1066,8 @@ void loop() {
   }
 
   updateCalibration(nowMs, leadsOff, lockout);
+  updateBrpm(nowMs, leadsOff, lockout);
+  rmssdNorm = computeRmssdNorm();
 
   // Drain RR log queue and run any time-sync command from PC.
   pollSerial();
@@ -820,5 +1080,6 @@ void loop() {
     drawBar();
     writeSummaryRow(leadsOff);
     emitSummary(leadsOff);
+    emitBrpm();
   }
 }

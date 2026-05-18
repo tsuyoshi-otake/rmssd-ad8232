@@ -50,6 +50,12 @@ RR_HEADER = [
 ]
 ECG_HEADER = ["wall_iso", "session_ms", "raw"]
 EVENT_HEADER = ["wall_iso", "session_ms", "unix_ms", "event", "param"]
+BREATH_HEADER = [
+    "wall_iso", "session_ms", "unix_ms",
+    "brpm", "brpm_conf", "brpm_source",   # 0=NONE,1=FM,2=AM,3=FUSED
+    "rmssd_norm",
+    "brpm_fm", "rqi_fm", "brpm_am", "rqi_am",
+]
 
 
 def update_latest_pointer(data_dir: Path, session_name: str) -> None:
@@ -101,11 +107,13 @@ def main() -> int:
     rr_f      = (session_dir / "rr.csv").open(     "w", newline="", encoding="utf-8", buffering=1)
     ecg_f     = (session_dir / "ecg.csv").open(    "w", newline="", encoding="utf-8", buffering=1)
     events_f  = (session_dir / "events.csv").open( "w", newline="", encoding="utf-8", buffering=1)
+    breath_f  = (session_dir / "breath.csv").open( "w", newline="", encoding="utf-8", buffering=1)
 
     summary_w = csv.writer(summary_f); summary_w.writerow(SUMMARY_HEADER)
     rr_w      = csv.writer(rr_f);      rr_w.writerow(RR_HEADER)
     ecg_w     = csv.writer(ecg_f);     ecg_w.writerow(ECG_HEADER)
     events_w  = csv.writer(events_f);  events_w.writerow(EVENT_HEADER)
+    breath_w  = csv.writer(breath_f);  breath_w.writerow(BREATH_HEADER)
 
     print(f"[host] session dir: {session_dir}", file=sys.stderr)
     print(f"[host] opening {args.port} @ {args.baud}", file=sys.stderr)
@@ -145,6 +153,8 @@ def main() -> int:
                         summary_w.writerow([wall] + parts[1:10])
                     elif kind == "R" and len(parts) >= 10:
                         rr_w.writerow([wall] + parts[1:10])
+                    elif kind == "B" and len(parts) >= 11:
+                        breath_w.writerow([wall] + parts[1:11])
                     elif kind == "I" and len(parts) >= 4:
                         ev = parts[3]
                         param = ",".join(parts[4:]) if len(parts) > 4 else ""
@@ -159,7 +169,7 @@ def main() -> int:
         except KeyboardInterrupt:
             print("\n[host] stopping (Ctrl+C)", file=sys.stderr)
 
-    summary_f.close(); rr_f.close(); ecg_f.close(); events_f.close()
+    summary_f.close(); rr_f.close(); ecg_f.close(); events_f.close(); breath_f.close()
     print(f"[host] CSVs flushed in {session_dir}", file=sys.stderr)
     return 0
 
