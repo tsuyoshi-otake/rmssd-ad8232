@@ -15,11 +15,12 @@ M5Stack Basic + AD8232 で心電図を取って、R波を検出し、RR間隔の
 
 | 部品 | 備考 |
 |------|------|
-| M5Stack Basic | ESP32 + 320x240 LCD |
+| M5Stack Basic | ESP32 + 320x240 LCD + MicroSDスロット内蔵 |
 | AD8232 ECG モジュール | Keyestudio 版（本プロジェクトの配線表はこれ前提）。SparkFun 版はピン名が `SDN`/`3.3V` などで少し違うので適宜読み替え |
 | 使い捨て ECG 電極 × 3 | スナップ式（バイオセンスやアンブー製のホルター用ゲル電極）。 |
 | 電極リード線 | AD8232 付属のスナップ・モノラルジャック3本（赤=RA, 黄=LA, 緑/黒=RL） |
 | ジャンパーワイヤー数本 | M5Stack BASE:AAA に挿す用 |
+| MicroSDカード | 長期ログを取るなら必須。FAT32フォーマット推奨。容量は1GBで十分（数日分のログでも数十MB程度） |
 
 ## 配線 (M5Stack BASE:AAA)
 
@@ -95,6 +96,9 @@ $pio = "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
 |--------|------|
 | **BtnA**（左） | キャリブレーション窓をクリアして最初からやり直し（5分待ち再開） |
 | **BtnB**（中央）| `frozen` ⇄ `rolling` をトグル。`frozen` にした瞬間のベースラインで固定したいとき用 |
+| **BtnC**（右） | MicroSD ログの `LOG ON` / `LOG OFF` をトグル。`SD FAIL` のときは押しても無効 |
+
+画面右上に `LOG ON`（緑）／`LOG OFF`（灰）／`SD FAIL`（赤）が常時表示される。
 
 電極が外れると `LEADS OFF` と表示され、波形描画もキャリブレーションのサンプル蓄積も止まる。電極を貼り直せば自然に再開する。
 
@@ -108,16 +112,69 @@ RMSSDは敏感な指標で、生理状態以外の要因で簡単に変動する
 - **時刻・カフェイン・直前の運動・食事・睡眠・気温**などすべてが効く。比較するなら **同じ時間帯・同じ姿勢・同じ呼吸条件** で。
 - **絶対値の RMSSD は個人差が大きい。** 「他人の値と比べてどうか」は意味が薄い。自分のベースラインとの相対変化を見る装置として割り切る。
 
-## ファイル構成
+## MicroSD ログ
+
+長期解析用に **MicroSD への CSV ログ**を取る。LCD 表示はオシロ的な「いま」を、SD ログは「あと」を見るための主データ。BLE はまだ実装していない。
+
+### ログファイル
+
+セッションごとに 2 つの CSV を作る。
+
+| ファイル | 内容 | 更新タイミング |
+|----------|------|----------------|
+| `/rr_NNNNNN.csv` | R 波検出ごとの 1 行（RR 間隔、瞬時 BPM、その時の RMSSD など） | R 波検出毎 |
+| `/summary_NNNNNN.csv` | 画面表示値のスナップショット（HR / RMSSD / baseline / ratio など） | 500 ms ごと |
+
+`NNNNNN` は 6 桁ゼロ詰めの連番。既存ファイルを上書きしないよう、空いている番号を自動探索する。
+
+I/O 効率のため、**ファイルは開きっぱなしで 5 秒ごとに flush** している。`sampleECG()` や ISR 内で SD アクセスはしない（loop 側で消費）。
+
+### RR ログ列
 
 ```
-rmssd-ad8232/
-├── platformio.ini              ; m5stack-core-esp32, COM3, 921600bps
-├── src/main.cpp                ; サンプリング(250Hz) + R波検出 + RMSSD + 描画
-├── README.md
-├── ECG HRV viewer wiring and guide.png
-└── .gitignore
+session_ms,unix_time_ms,iso_time,rr_ms,bpm,rmssd_ms,baseline_ms,ratio,rr_count,quality,leads_off
 ```
+
+| 列 | 意味 |
+|----|------|
+| `session_ms` | 起動からの経過 ms（時刻同期なしでも必ず入る） |
+| `unix_time_ms` | Unix ms。時刻同期前は `0` |
+| `iso_time` | ISO8601 UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`。同期前は空 |
+| `rr_ms` | 今回検出した RR 間隔 (ms) |
+| `bpm` | `60000 / rr_ms` |
+| `rmssd_ms` | その時点の RMSSD |
+| `baseline_ms` | 採用ベースライン RMSSD。未確定は `0` |
+| `ratio` | `rmssd / baseline_ms`。未確定は `0` |
+| `rr_count` | RMSSD 計算に使えた RR の本数 |
+| `quality` | 簡易品質指標。現状 `1.0` 固定（将来用） |
+| `leads_off` | 0/1（R 波検出時点は常に 0） |
+
+### Summary ログ列
+
+```
+session_ms,unix_time_ms,iso_time,bpm,rmssd_ms,baseline_ms,ratio,rr_count,leads_off,noise_count
+```
+
+`noise_count` は現状 `0` 固定（将来の RR 棄却カウント用）。
+
+### 時刻同期（任意）
+
+絶対時刻が不要なら `session_ms` だけで PC 側で十分解析できる。**絶対時刻を入れたい場合**はシリアルから `TIME <unix秒>` を1行送る：
+
+```powershell
+# PowerShell から現在時刻 (UTC) を送る例
+$pio = "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
+$unix = [int][double]::Parse((Get-Date -UFormat %s -Date (Get-Date).ToUniversalTime()))
+"TIME $unix" | & $pio device monitor --echo
+# または別のシリアル端末から「TIME 1738362600」のように改行付きで送る
+```
+
+ファームから `TIME SET:1738362600` が返れば成功。以降の `unix_time_ms` / `iso_time` 列が埋まる。
+時刻同期は揮発で、リセットすると再設定が必要。
+
+### 連続稼働時間
+
+BASE:AAA + LCD 常時表示で **おおむね 3〜6時間**（バッテリー条件・LCD 明るさ依存）。終夜記録には外部給電が必要。
 
 ## 信号処理メモ
 
@@ -134,9 +191,12 @@ rmssd-ad8232/
 
 ## シリアル出力
 
-500 ms 毎に CSV ライクで出力される。SD 保存も Wi-Fi 送信もしないので、長時間ロギングしたい場合は PC 側で `pio device monitor` の出力を `Tee-Object` 等で受ける。
+主データは MicroSD に出るが、リアルタイム監視用に 500 ms 毎の CSV ライクサマリーもシリアルへ流す。
 
 ```
+SD OK
+RR_LOG:/rr_000001.csv
+SUMMARY_LOG:/summary_000001.csv
 BPM:72.4,RMSSD:43.1,BASE:38.0,CALIBN:60,FROZEN:0,DROPS:0
 BPM:71.9,RMSSD:43.5,BASE:38.0,CALIBN:60,FROZEN:0,DROPS:0
 ...
@@ -151,6 +211,12 @@ BPM:71.9,RMSSD:43.5,BASE:38.0,CALIBN:60,FROZEN:0,DROPS:0
 | `FROZEN` | 1 = freeze 中（rolling 停止）、0 = rolling 中 |
 | `DROPS`  | ISR でリングバッファが満杯になって落としたサンプル数（健全なら 0 のまま） |
 
+イベント行は他に `SD OK` / `SD FAIL` / `RR_LOG:...` / `SUMMARY_LOG:...` / `LOG:ON|OFF` / `TIME SET:<unix>`。
+
+PC 側で同じデータを保存したい場合：
+
 ```powershell
-& $pio device monitor | Tee-Object -FilePath hrv_log.csv
+& $pio device monitor | Tee-Object -FilePath hrv_serial.csv
 ```
+
+ただし長期ログの主役は MicroSD 側の `rr_NNNNNN.csv` / `summary_NNNNNN.csv` 推奨（PC レスで欠損しない）。

@@ -1,7 +1,12 @@
 #include <M5Stack.h>
 #include <driver/adc.h>
 #include <driver/gpio.h>
+#include <SD.h>
+#include <SPI.h>
 #include <math.h>
+#include <time.h>
+#include <string.h>
+#include <stdlib.h>
 
 // ---------- Pins ----------
 constexpr int      ECG_PIN       = 34;  // AD8232 OUTPUT
@@ -21,6 +26,11 @@ constexpr uint32_t CALIB_MIN_MS    = 5UL * 60UL * 1000UL;  // 5 minutes minimum
 constexpr uint32_t CALIB_SAMPLE_MS = 5UL * 1000UL;         // pull one RMSSD every 5 s
 constexpr int      CALIB_BUF_SIZE  = 60;                   // 5 min / 5 s
 constexpr int      CALIB_MIN_FILL  = 50;                   // need >= 80% full to accept
+
+// ---------- SD logging ----------
+constexpr int      SD_CS_PIN          = 4;       // M5Stack Basic on-board MicroSD CS
+constexpr uint32_t FLUSH_INTERVAL_MS  = 5000;    // flush both log files every 5 s
+constexpr int      RR_LOG_QUEUE_SIZE  = 32;      // RR events buffered between loop iterations
 
 // ---------- Layout ----------
 constexpr int SCREEN_W = 320;
@@ -80,6 +90,37 @@ static bool     beatTick  = false;
 static uint32_t bootMs    = 0;
 static uint32_t nextDisplayMs = 0;
 
+// ---------- SD logging state ----------
+static bool      sdOk             = false;
+static bool      loggingEnabled   = false;
+static File      rrLogFile;
+static File      sumLogFile;
+static char      rrLogPath[40]    = "";
+static char      sumLogPath[40]   = "";
+static uint32_t  lastFlushMs      = 0;
+static uint32_t  sessionStartMs   = 0;
+static uint64_t  timeBaseUnixMs   = 0;   // 0 = not yet synced
+static uint32_t  timeBaseMillis   = 0;
+
+struct RREvent {
+  uint32_t session_ms;
+  uint64_t unix_time_ms;
+  float    rr_ms;
+  float    bpm;
+  float    rmssd_ms;
+  float    baseline_ms;
+  float    ratio;
+  int      rr_count;
+  bool     leads_off;
+};
+static RREvent rrLogQueue[RR_LOG_QUEUE_SIZE];
+static int     rrLogQHead = 0;   // producer (registerBeat)
+static int     rrLogQTail = 0;   // consumer (loop)
+
+// Serial line buffer for TIME command
+static char    serBuf[64];
+static int     serPos = 0;
+
 // ---------- ISR ----------
 void IRAM_ATTR onSampleTimer() {
   uint16_t next = (ringHead + 1) % RING_SIZE;
@@ -124,6 +165,192 @@ float calcRMSSD() {
   }
   if (n == 0) return 0;
   return sqrtf(sumsq / (float)n);
+}
+
+// ---------- Time helpers ----------
+static uint64_t nowUnixMs() {
+  if (timeBaseUnixMs == 0) return 0;
+  return timeBaseUnixMs + (uint64_t)(millis() - timeBaseMillis);
+}
+
+// Fills dst with ISO8601 UTC string "YYYY-MM-DDTHH:MM:SS.mmmZ" (24 chars + NUL).
+// dst[0] = '\0' when unixMs is 0.
+static void isoFromUnixMs(uint64_t unixMs, char* dst, size_t cap) {
+  if (cap == 0) return;
+  if (unixMs == 0) { dst[0] = '\0'; return; }
+  time_t s = (time_t)(unixMs / 1000ULL);
+  struct tm tm;
+  gmtime_r(&s, &tm);
+  snprintf(dst, cap, "%04d-%02d-%02dT%02d:%02d:%02d.%03luZ",
+           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+           tm.tm_hour, tm.tm_min, tm.tm_sec,
+           (unsigned long)(unixMs % 1000ULL));
+}
+
+// Format a uint64 as decimal (Arduino Print can't handle uint64 portably).
+static void u64ToStr(uint64_t v, char* dst, size_t cap) {
+  if (v == 0) { snprintf(dst, cap, "0"); return; }
+  char buf[24];
+  int p = 0;
+  while (v > 0 && p < (int)sizeof(buf)) {
+    buf[p++] = '0' + (int)(v % 10);
+    v /= 10;
+  }
+  size_t i = 0;
+  while (p > 0 && i + 1 < cap) {
+    dst[i++] = buf[--p];
+  }
+  dst[i] = '\0';
+}
+
+// ---------- SD helpers ----------
+static bool findNextLogPath(const char* prefix, char* dst, size_t cap) {
+  for (int i = 1; i < 1000000; i++) {
+    snprintf(dst, cap, "/%s_%06d.csv", prefix, i);
+    if (!SD.exists(dst)) return true;
+  }
+  dst[0] = '\0';
+  return false;
+}
+
+static void initSdLogging() {
+  sdOk = SD.begin(SD_CS_PIN);
+  if (!sdOk) {
+    Serial.println("SD FAIL");
+    loggingEnabled = false;
+    return;
+  }
+  Serial.println("SD OK");
+
+  if (!findNextLogPath("rr", rrLogPath, sizeof(rrLogPath))) {
+    Serial.println("SD: no free RR slot");
+    sdOk = false;
+    return;
+  }
+  if (!findNextLogPath("summary", sumLogPath, sizeof(sumLogPath))) {
+    Serial.println("SD: no free summary slot");
+    sdOk = false;
+    return;
+  }
+
+  rrLogFile  = SD.open(rrLogPath,  FILE_WRITE);
+  sumLogFile = SD.open(sumLogPath, FILE_WRITE);
+  if (!rrLogFile || !sumLogFile) {
+    Serial.println("SD: open failed");
+    if (rrLogFile)  rrLogFile.close();
+    if (sumLogFile) sumLogFile.close();
+    sdOk = false;
+    return;
+  }
+
+  rrLogFile.println(
+    "session_ms,unix_time_ms,iso_time,rr_ms,bpm,rmssd_ms,baseline_ms,"
+    "ratio,rr_count,quality,leads_off");
+  sumLogFile.println(
+    "session_ms,unix_time_ms,iso_time,bpm,rmssd_ms,baseline_ms,ratio,"
+    "rr_count,leads_off,noise_count");
+  rrLogFile.flush();
+  sumLogFile.flush();
+
+  loggingEnabled = true;
+  Serial.print("RR_LOG:");      Serial.println(rrLogPath);
+  Serial.print("SUMMARY_LOG:"); Serial.println(sumLogPath);
+}
+
+static void enqueueRREvent(float rr, bool leadsOff) {
+  int next = (rrLogQHead + 1) % RR_LOG_QUEUE_SIZE;
+  if (next == rrLogQTail) return;  // queue full -> drop oldest by skipping new
+  RREvent& e = rrLogQueue[rrLogQHead];
+  e.session_ms   = millis() - sessionStartMs;
+  e.unix_time_ms = nowUnixMs();
+  e.rr_ms        = rr;
+  e.bpm          = (rr > 0) ? (60000.0f / rr) : 0;
+  e.rmssd_ms     = rmssd;
+  e.baseline_ms  = isnan(rmssdBase) ? 0.0f : rmssdBase;
+  e.ratio        = (isnan(rmssdBase) || rmssdBase <= 0)
+                     ? 0.0f
+                     : (rmssd / rmssdBase);
+  e.rr_count     = rrCount;
+  e.leads_off    = leadsOff;
+  rrLogQHead = next;
+}
+
+static void drainRRLog() {
+  if (!loggingEnabled || !rrLogFile) {
+    rrLogQTail = rrLogQHead;  // drop queued events when logging is off
+    return;
+  }
+  while (rrLogQTail != rrLogQHead) {
+    const RREvent& e = rrLogQueue[rrLogQTail];
+    rrLogQTail = (rrLogQTail + 1) % RR_LOG_QUEUE_SIZE;
+
+    char iso[28];   isoFromUnixMs(e.unix_time_ms, iso, sizeof(iso));
+    char unixStr[24]; u64ToStr(e.unix_time_ms, unixStr, sizeof(unixStr));
+    char line[200];
+    snprintf(line, sizeof(line),
+             "%lu,%s,%s,%.1f,%.2f,%.2f,%.2f,%.4f,%d,%.2f,%d",
+             (unsigned long)e.session_ms,
+             unixStr, iso,
+             e.rr_ms, e.bpm, e.rmssd_ms, e.baseline_ms,
+             e.ratio, e.rr_count, 1.0f, e.leads_off ? 1 : 0);
+    rrLogFile.println(line);
+  }
+}
+
+static void writeSummaryRow(bool leadsOff) {
+  if (!loggingEnabled || !sumLogFile) return;
+  uint64_t ums = nowUnixMs();
+  char iso[28];   isoFromUnixMs(ums, iso, sizeof(iso));
+  char unixStr[24]; u64ToStr(ums, unixStr, sizeof(unixStr));
+  float baseline = isnan(rmssdBase) ? 0.0f : rmssdBase;
+  float ratio    = (isnan(rmssdBase) || rmssdBase <= 0)
+                     ? 0.0f
+                     : (rmssd / rmssdBase);
+  char line[200];
+  snprintf(line, sizeof(line),
+           "%lu,%s,%s,%.2f,%.2f,%.2f,%.4f,%d,%d,%d",
+           (unsigned long)(millis() - sessionStartMs),
+           unixStr, iso,
+           bpm, rmssd, baseline, ratio,
+           rrCount, leadsOff ? 1 : 0, 0 /* noise_count */);
+  sumLogFile.println(line);
+}
+
+static void maybeFlushLogs() {
+  if (!loggingEnabled) return;
+  uint32_t now = millis();
+  if ((now - lastFlushMs) < FLUSH_INTERVAL_MS) return;
+  lastFlushMs = now;
+  if (rrLogFile)  rrLogFile.flush();
+  if (sumLogFile) sumLogFile.flush();
+}
+
+// ---------- Serial command (TIME <unix_sec>) ----------
+static void handleSerialLine(const char* line) {
+  if (strncmp(line, "TIME ", 5) != 0) return;
+  uint32_t t = (uint32_t)strtoul(line + 5, nullptr, 10);
+  if (t == 0) return;
+  timeBaseUnixMs = (uint64_t)t * 1000ULL;
+  timeBaseMillis = millis();
+  Serial.print("TIME SET:");
+  Serial.println((unsigned long)t);
+}
+
+static void pollSerial() {
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serPos > 0) {
+        serBuf[serPos] = '\0';
+        handleSerialLine(serBuf);
+        serPos = 0;
+      }
+    } else if (serPos < (int)sizeof(serBuf) - 1) {
+      serBuf[serPos++] = (char)c;
+    } else {
+      serPos = 0;  // overflow: discard line
+    }
+  }
 }
 
 // ---------- Calibration helpers ----------
@@ -183,6 +410,7 @@ void registerBeat(uint32_t tMs, float peak) {
       addRR(rr);
       bpm = 60000.0f / rr;
       rmssd = calcRMSSD();
+      enqueueRREvent(rr, /*leadsOff=*/false);  // detection only fires when leads on
     }
   }
   lastBeatMs = tMs;
@@ -239,8 +467,24 @@ void drawGridBaseline() {
   M5.Lcd.endWrite();
 }
 
+void drawLogIndicator() {
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setCursor(SCREEN_W - 50, STATS_TOP + 4);
+  if (!sdOk) {
+    M5.Lcd.setTextColor(RED, BLACK);
+    M5.Lcd.print("SD FAIL");
+  } else if (loggingEnabled) {
+    M5.Lcd.setTextColor(GREEN, BLACK);
+    M5.Lcd.print("LOG ON ");
+  } else {
+    M5.Lcd.setTextColor(DARKGREY, BLACK);
+    M5.Lcd.print("LOG OFF");
+  }
+}
+
 void drawStats(bool leadsOff, bool lockout) {
   M5.Lcd.fillRect(0, STATS_TOP, SCREEN_W, STATS_H, BLACK);
+  drawLogIndicator();
   M5.Lcd.setTextSize(2);
 
   if (leadsOff) {
@@ -407,12 +651,19 @@ void setup() {
   M5.Lcd.setTextColor(WHITE, BLACK);
   M5.Lcd.setCursor(4, 4);
   M5.Lcd.println("AD8232 HRV");
+
+  // Try SD init before the main UI starts.  Failures are non-fatal: measurement
+  // and LCD/Serial output keep working, only logging is disabled.
+  bootMs         = millis();
+  sessionStartMs = bootMs;
+  initSdLogging();
+  lastFlushMs    = millis();
+
   delay(400);
   M5.Lcd.fillScreen(BLACK);
   drawGridBaseline();
   drawBar();
 
-  bootMs = millis();
   resetCalibration(bootMs);
 
   // 80 MHz APB / prescaler 80 -> 1 MHz timer; alarm at SAMPLE_US ticks
@@ -437,20 +688,32 @@ void loop() {
   bool     leadsOff = (digitalRead(LO_PLUS_PIN) || digitalRead(LO_MINUS_PIN));
   bool     lockout  = (nowMs - bootMs) < STARTUP_LOCKOUT_MS;
 
-  // BtnA: restart calibration. BtnB: freeze / unfreeze the rolling baseline.
+  // BtnA: restart calibration. BtnB: freeze/unfreeze rolling baseline.
+  // BtnC: toggle SD logging (no-op if SD is not OK).
   if (M5.BtnA.wasPressed()) {
     resetCalibration(nowMs);
   }
   if (M5.BtnB.wasPressed() && !isnan(rmssdBase)) {
     baselineFrozen = !baselineFrozen;
   }
+  if (M5.BtnC.wasPressed() && sdOk) {
+    loggingEnabled = !loggingEnabled;
+    Serial.print("LOG:");
+    Serial.println(loggingEnabled ? "ON" : "OFF");
+  }
 
   updateCalibration(nowMs, leadsOff, lockout);
+
+  // Drain RR log queue and run any time-sync command from PC.
+  pollSerial();
+  drainRRLog();
+  maybeFlushLogs();
 
   if (nowMs > nextDisplayMs) {
     nextDisplayMs = nowMs + 500;
     drawStats(leadsOff, lockout);
     drawBar();
+    writeSummaryRow(leadsOff);
 
     Serial.print("BPM:");     Serial.print(bpm);
     Serial.print(",RMSSD:");  Serial.print(rmssd);
