@@ -203,6 +203,57 @@ static void u64ToStr(uint64_t v, char* dst, size_t cap) {
   dst[i] = '\0';
 }
 
+// ---------- Serial emitters (unified I/S/R/E format) ----------
+// Forward state used by emitSummary / emitRR / emitEcgSample
+static bool ecgStreamEnabled = true;  // default ON; toggle with "ECG ON|OFF"
+
+static void emitCommonPrefix(char kind) {
+  Serial.print(kind);
+  Serial.print(',');
+  Serial.print((unsigned long)(millis() - sessionStartMs));
+  Serial.print(',');
+  char unixStr[24]; u64ToStr(nowUnixMs(), unixStr, sizeof(unixStr));
+  Serial.print(unixStr);
+}
+
+static void emitEvent(const char* code, const char* param = nullptr) {
+  emitCommonPrefix('I');
+  Serial.print(',');
+  Serial.print(code);
+  if (param && param[0]) {
+    Serial.print(',');
+    Serial.print(param);
+  }
+  Serial.println();
+}
+
+static void emitSummary(bool leadsOff) {
+  emitCommonPrefix('S');
+  float baseline = isnan(rmssdBase) ? 0.0f : rmssdBase;
+  Serial.printf(",%.2f,%.2f,%.2f,%d,%d,%lu,%d\n",
+                bpm, rmssd, baseline,
+                calibCount, baselineFrozen ? 1 : 0,
+                (unsigned long)ringDrops, leadsOff ? 1 : 0);
+}
+
+static void emitRR(float rr) {
+  emitCommonPrefix('R');
+  float baseline = isnan(rmssdBase) ? 0.0f : rmssdBase;
+  float ratio    = (isnan(rmssdBase) || rmssdBase <= 0) ? 0.0f : (rmssd / rmssdBase);
+  Serial.printf(",%.1f,%.2f,%.2f,%.2f,%.4f,%d,%d\n",
+                rr, (rr > 0 ? 60000.0f / rr : 0.0f),
+                rmssd, baseline, ratio, rrCount, 0);
+}
+
+static void emitEcgSample(int raw) {
+  if (!ecgStreamEnabled) return;
+  Serial.print('E');
+  Serial.print(',');
+  Serial.print((unsigned long)(millis() - sessionStartMs));
+  Serial.print(',');
+  Serial.println(raw);
+}
+
 // ---------- SD helpers ----------
 static bool findNextLogPath(const char* prefix, char* dst, size_t cap) {
   for (int i = 1; i < 1000000; i++) {
@@ -216,19 +267,15 @@ static bool findNextLogPath(const char* prefix, char* dst, size_t cap) {
 static void initSdLogging() {
   sdOk = SD.begin(SD_CS_PIN);
   if (!sdOk) {
-    Serial.println("SD FAIL");
+    emitEvent("SD_FAIL");
     loggingEnabled = false;
     return;
   }
-  Serial.println("SD OK");
+  emitEvent("SD_OK");
 
-  if (!findNextLogPath("rr", rrLogPath, sizeof(rrLogPath))) {
-    Serial.println("SD: no free RR slot");
-    sdOk = false;
-    return;
-  }
-  if (!findNextLogPath("summary", sumLogPath, sizeof(sumLogPath))) {
-    Serial.println("SD: no free summary slot");
+  if (!findNextLogPath("rr", rrLogPath, sizeof(rrLogPath)) ||
+      !findNextLogPath("summary", sumLogPath, sizeof(sumLogPath))) {
+    emitEvent("SD_FAIL", "no_free_slot");
     sdOk = false;
     return;
   }
@@ -236,7 +283,7 @@ static void initSdLogging() {
   rrLogFile  = SD.open(rrLogPath,  FILE_WRITE);
   sumLogFile = SD.open(sumLogPath, FILE_WRITE);
   if (!rrLogFile || !sumLogFile) {
-    Serial.println("SD: open failed");
+    emitEvent("SD_FAIL", "open_failed");
     if (rrLogFile)  rrLogFile.close();
     if (sumLogFile) sumLogFile.close();
     sdOk = false;
@@ -253,8 +300,8 @@ static void initSdLogging() {
   sumLogFile.flush();
 
   loggingEnabled = true;
-  Serial.print("RR_LOG:");      Serial.println(rrLogPath);
-  Serial.print("SUMMARY_LOG:"); Serial.println(sumLogPath);
+  emitEvent("RR_LOG",  rrLogPath);
+  emitEvent("SUM_LOG", sumLogPath);
 }
 
 static void enqueueRREvent(float rr, bool leadsOff) {
@@ -325,15 +372,27 @@ static void maybeFlushLogs() {
   if (sumLogFile) sumLogFile.flush();
 }
 
-// ---------- Serial command (TIME <unix_sec>) ----------
+// ---------- Serial command (TIME <unix_sec>, ECG ON|OFF) ----------
 static void handleSerialLine(const char* line) {
-  if (strncmp(line, "TIME ", 5) != 0) return;
-  uint32_t t = (uint32_t)strtoul(line + 5, nullptr, 10);
-  if (t == 0) return;
-  timeBaseUnixMs = (uint64_t)t * 1000ULL;
-  timeBaseMillis = millis();
-  Serial.print("TIME SET:");
-  Serial.println((unsigned long)t);
+  if (strncmp(line, "TIME ", 5) == 0) {
+    uint32_t t = (uint32_t)strtoul(line + 5, nullptr, 10);
+    if (t == 0) return;
+    timeBaseUnixMs = (uint64_t)t * 1000ULL;
+    timeBaseMillis = millis();
+    char buf[16]; snprintf(buf, sizeof(buf), "%lu", (unsigned long)t);
+    emitEvent("TIME_SET", buf);
+    return;
+  }
+  if (strcmp(line, "ECG ON") == 0) {
+    ecgStreamEnabled = true;
+    emitEvent("ECG_ON");
+    return;
+  }
+  if (strcmp(line, "ECG OFF") == 0) {
+    ecgStreamEnabled = false;
+    emitEvent("ECG_OFF");
+    return;
+  }
 }
 
 static void pollSerial() {
@@ -411,6 +470,7 @@ void registerBeat(uint32_t tMs, float peak) {
       bpm = 60000.0f / rr;
       rmssd = calcRMSSD();
       enqueueRREvent(rr, /*leadsOff=*/false);  // detection only fires when leads on
+      emitRR(rr);
     }
   }
   lastBeatMs = tMs;
@@ -586,6 +646,7 @@ int median3(int v) {
 
 void processSample(int rawIn, bool leadsOff) {
   int raw = median3(rawIn);
+  emitEcgSample(raw);
 
   ecgBase += 0.002f * ((float)raw - ecgBase);
   float sig    = (float)raw - ecgBase;
@@ -636,8 +697,13 @@ void processSample(int rawIn, bool leadsOff) {
 }
 
 // ---------- Arduino ----------
+constexpr uint8_t LCD_BRIGHTNESS = 0;  // minimum backlight; raise to 8..16 for daylight visibility
+
 void setup() {
-  M5.begin();  // also initializes Serial @ 115200
+  M5.begin();              // also initializes Serial; we re-init at 460800 below
+  Serial.begin(460800);    // higher baud for ECG raw streaming (~5 KB/s)
+
+  M5.Lcd.setBrightness(LCD_BRIGHTNESS);
 
   pinMode(LO_PLUS_PIN,  INPUT_PULLDOWN);
   pinMode(LO_MINUS_PIN, INPUT_PULLDOWN);
@@ -656,6 +722,7 @@ void setup() {
   // and LCD/Serial output keep working, only logging is disabled.
   bootMs         = millis();
   sessionStartMs = bootMs;
+  emitEvent("BOOT");
   initSdLogging();
   lastFlushMs    = millis();
 
@@ -698,8 +765,7 @@ void loop() {
   }
   if (M5.BtnC.wasPressed() && sdOk) {
     loggingEnabled = !loggingEnabled;
-    Serial.print("LOG:");
-    Serial.println(loggingEnabled ? "ON" : "OFF");
+    emitEvent(loggingEnabled ? "LOG_ON" : "LOG_OFF");
   }
 
   updateCalibration(nowMs, leadsOff, lockout);
@@ -714,12 +780,6 @@ void loop() {
     drawStats(leadsOff, lockout);
     drawBar();
     writeSummaryRow(leadsOff);
-
-    Serial.print("BPM:");     Serial.print(bpm);
-    Serial.print(",RMSSD:");  Serial.print(rmssd);
-    Serial.print(",BASE:");   Serial.print(isnan(rmssdBase) ? 0 : rmssdBase);
-    Serial.print(",CALIBN:"); Serial.print(calibCount);
-    Serial.print(",FROZEN:"); Serial.print(baselineFrozen ? 1 : 0);
-    Serial.print(",DROPS:");  Serial.println(ringDrops);
+    emitSummary(leadsOff);
   }
 }

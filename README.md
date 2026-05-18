@@ -189,34 +189,121 @@ BASE:AAA + LCD 常時表示で **おおむね 3〜6時間**（バッテリー条
 - **自動キャリブレーション**: 5秒毎に 1サンプル、最大 60 サンプル（5分間）の **rolling 中央値** をベースラインに採用。起動から 5分経過 + サンプル数 ≥ 50 で確定し、以後 5秒毎に更新
 - **PNSプロキシバー**: `RMSSD / RMSSD_baseline` を log2 スケールで [0.5x, 2.0x] に正規化
 
-## シリアル出力
+## シリアル仕様 (460800 bps)
 
-主データは MicroSD に出るが、リアルタイム監視用に 500 ms 毎の CSV ライクサマリーもシリアルへ流す。
+ECG 生波形まで含めるためボーレートを **460800 bps** に上げている（旧 115200 から変更）。`platformio.ini` の `monitor_speed = 460800` を参照。
+
+すべての行は **行頭1文字でレコード種別**を表す統一フォーマット：
+
+| 種別 | フォーマット | 頻度 |
+|------|--------------|------|
+| `I` | `I,<session_ms>,<unix_ms>,<event>[,<param>]` | イベント時 |
+| `S` | `S,<session_ms>,<unix_ms>,<bpm>,<rmssd>,<base>,<calibn>,<frozen>,<drops>,<leads_off>` | 500 ms 毎 |
+| `R` | `R,<session_ms>,<unix_ms>,<rr_ms>,<bpm>,<rmssd>,<base>,<ratio>,<rr_count>,<leads_off>` | R 波検出毎 |
+| `E` | `E,<session_ms>,<raw>` | 250 Hz（デフォルト ON、`ECG OFF` で停止） |
+
+`<unix_ms>` は `TIME` 同期前は `0`。
+
+主なイベントコード：`BOOT` / `SD_OK` / `SD_FAIL` / `RR_LOG` / `SUM_LOG` / `LOG_ON` / `LOG_OFF` / `TIME_SET` / `ECG_ON` / `ECG_OFF`
+
+### PC → ファーム コマンド
+
+行末は `\n` または `\r\n`。
+
+| コマンド | 動作 |
+|----------|------|
+| `TIME <unix_sec>` | 絶対時刻同期。応答に `I,...,TIME_SET,<unix_sec>` |
+| `ECG ON` / `ECG OFF` | ECG 生波形 (E行) ストリームの ON/OFF |
+
+### 帯域目安
+
+ECG 250Hz ON 時で約 5 KB/s ≈ 40 kbps、460800bps の 9% 程度。シリアル使用率はゆとりがあり、HW FIFO ブロックは発生しない。
+
+## PC でリアルタイム取得（AI 分析用）
+
+`tools/monitor.py` でシリアルを PC 側 CSV に切り出します。Claude Code / Codex に「`data/latest/summary.csv` を分析して」と依頼すれば、そのままデータを読んで解析させられます。
+
+### 依存
+
+```powershell
+pip install pyserial
+# or use the platformio venv that already has it:
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" -m pip show pyserial
+```
+
+### 実行
+
+```powershell
+$py = "$env:USERPROFILE\.platformio\penv\Scripts\python.exe"
+
+# 標準: COM3, 460800bps, TIME 自動同期, ECG raw も保存
+& $py tools/monitor.py
+
+# ECG raw は要らない（ファイル肥大を避けたい）
+& $py tools/monitor.py --no-ecg
+
+# 別ポート / 別出力先
+& $py tools/monitor.py --port COM4 --data-dir D:/hrv
+```
+
+Ctrl+C で停止。各 CSV は **行バッファで常時 flush** されるので、途中まででも安全に解析できる。
+
+### 出力ファイル
 
 ```
-SD OK
-RR_LOG:/rr_000001.csv
-SUMMARY_LOG:/summary_000001.csv
-BPM:72.4,RMSSD:43.1,BASE:38.0,CALIBN:60,FROZEN:0,DROPS:0
-BPM:71.9,RMSSD:43.5,BASE:38.0,CALIBN:60,FROZEN:0,DROPS:0
+data/
+├── session_20260518_220147/
+│   ├── ecg.csv       (250 Hz の wall_iso, session_ms, raw)
+│   ├── rr.csv        (R波毎)
+│   ├── summary.csv   (500 ms 毎、画面表示と同じ値)
+│   └── events.csv    (BOOT/SD_OK/TIME_SET など)
+└── latest -> session_20260518_220147/   (シンボリックリンク、Windowsで権限不足ならLATEST.txt)
+```
+
+`data/latest/summary.csv` のヘッダ：
+
+```csv
+wall_iso,session_ms,unix_ms,bpm,rmssd,base,calibn,frozen,drops,leads_off
+2026-05-18T13:01:48.863+00:00,540,1779109308540,72.4,43.1,38.0,60,0,0,0
 ...
 ```
 
-| カラム  | 意味 |
-|---------|------|
-| `BPM`    | 直近 RR から換算した瞬時心拍数 |
-| `RMSSD`  | 直近 128 RR から計算した RMSSD (ms) |
-| `BASE`   | ベースライン RMSSD (ms)。キャリブ未完なら 0 |
-| `CALIBN` | キャリブレーション窓の現在サンプル数 (最大 60) |
-| `FROZEN` | 1 = freeze 中（rolling 停止）、0 = rolling 中 |
-| `DROPS`  | ISR でリングバッファが満杯になって落としたサンプル数（健全なら 0 のまま） |
+### AI 分析のサンプル指示
 
-イベント行は他に `SD OK` / `SD FAIL` / `RR_LOG:...` / `SUMMARY_LOG:...` / `LOG:ON|OFF` / `TIME SET:<unix>`。
-
-PC 側で同じデータを保存したい場合：
-
-```powershell
-& $pio device monitor | Tee-Object -FilePath hrv_serial.csv
+```
+data/latest/summary.csv の直近10分の rmssd/base 比を見て、
+ベースラインから外れている区間と、その時の leads_off=0 を確認して、
+ストレス傾向を要約して。
 ```
 
-ただし長期ログの主役は MicroSD 側の `rr_NNNNNN.csv` / `summary_NNNNNN.csv` 推奨（PC レスで欠損しない）。
+### 注意
+
+- 起動直後の数百バイトは ESP32 ROM bootloader が **74880 bps** で出すメッセージなので、PC 側からは文字化けして `events.csv` に `RAW` 行として保存される（無害、捨ててOK）
+- PC ロガーが落ちても **MicroSD 側のログは継続する**（フォールバック）。逆に SD が無くても PC 側 CSV は取れる
+- `wall_iso` は PC 側で付ける UTC ISO8601。`unix_ms` はファーム側で `TIME` 同期後に入る。両方残しているのは同期前後の照合用
+
+## LCD 明るさ
+
+`src/main.cpp` の `constexpr uint8_t LCD_BRIGHTNESS = 0;` で制御。
+- `0` (デフォルト): バックライト最低（暗い部屋で視認可能、省電力）
+- `8〜16`: 明るい部屋でも見える
+- `64〜128`: M5Stack デフォルトに近い
+- `255`: 最大
+
+## ファイル構成
+
+```
+rmssd-ad8232/
+├── platformio.ini              ; m5stack-core-esp32, upload=921600, monitor=460800
+├── src/main.cpp                ; 250Hz ISR + R波検出 + RMSSD + LCD + SD + シリアルストリーム
+├── tools/
+│   ├── monitor.py              ; PC側ロガー (pyserial)
+│   └── requirements.txt        ; pyserial>=3.5
+├── data/                       ; (gitignore) PCロガー出力先
+│   ├── session_YYYYMMDD_HHMMSS/
+│   │   ├── ecg.csv, rr.csv, summary.csv, events.csv
+│   └── latest -> session_YYYYMMDD_HHMMSS/
+├── README.md
+├── ECG HRV viewer wiring and guide.png
+└── .gitignore
+```

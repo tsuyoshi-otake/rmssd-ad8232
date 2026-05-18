@@ -2,3 +2,6 @@
 .vscode/
 *.tmp
 *.bak
+data/
+__pycache__/
+*.pyc
